@@ -1,135 +1,225 @@
 defmodule Intcode do
-  defstruct opcode: nil, first_mode: nil, second_mode: nil, third_mode: nil
+  defstruct memory: Map.new(), execution_pointer: 0, stack_pointer: 0, input: []
 
-  @doc """
-    Processes a full program, instruction by instruction, returns the final program
-    after processing all instructions
-  """
-  def process_program(program, input, pointer \\ 0, relative_base \\ -1)
-  def process_program(program, input, 0, -1) do
-    program = program ++ List.duplicate(0, 100_000)
-    process_program(program, input, 0, 0)
+  @spec new([integer]) :: Intcode.t()
+  def new(code) when is_list(code) do
+    memory = Enum.with_index(code) |> Map.new(fn {value, index} -> {index, value} end)
+
+    %__MODULE__{
+      memory: memory
+    }
   end
-  def process_program(program, input, pointer, relative_base) do
-    instruction = parse_instruction(Enum.at(program, pointer))
 
-    case process_instruction(instruction, program, input, pointer, relative_base) do
-      {program, _input, -1, relative_base, output, :halt} ->
-        {program, output, -1, relative_base}
+  @spec push_input(Intcode.t(), [integer] | integer) :: Intcode.t()
+  def push_input(%__MODULE__{} = program, input) when is_integer(input) do
+    %__MODULE__{
+      program | input: program.input ++ [input]
+    }
+  end
 
-      {program, _input, next_pointer, relative_base, output, :halt} ->
-        # IO.puts(output)
-        #process_program(program, input, next_pointer, relative_base)
-        {program, output, next_pointer, relative_base}
+  def push_input(%__MODULE__{} = program, input) when is_list(input) do
+    %__MODULE__{
+      program | input: program.input ++ input
+    }
+  end
 
-      {program, input, next_pointer, relative_base, nil, :go} ->
-        process_program(program, input, next_pointer, relative_base)
+
+  def run_until_output(%__MODULE__{} = program) do
+    case process_next_instruction(program) do
+      {%__MODULE__{} = program, _, :halt} ->
+        {program, nil, :halt}
+
+      {%__MODULE__{} = program, nil, :cont} ->
+        run_until_output(program)
+
+      {%__MODULE__{} = program, output, :cont} ->
+        {program, output, :cont}
     end
   end
 
-  def process_instruction(instruction, program, input, pointer, relative_base) do
-    case instruction.opcode do
-      1 -> process_sum_instruction(instruction, program, input, pointer, relative_base)
-      2 -> process_mul_instruction(instruction, program, input, pointer, relative_base)
-      3 -> process_input_instruction(instruction, program, input, pointer, relative_base)
-      4 -> process_output_instruction(instruction, program, input, pointer, relative_base)
-      5 -> process_jump_if_true_instruction(instruction, program, input, pointer, relative_base)
-      6 -> process_jump_if_false_instruction(instruction, program, input, pointer, relative_base)
-      7 -> process_less_than_instruction(instruction, program, input, pointer, relative_base)
-      8 -> process_equals_instruction(instruction, program, input, pointer, relative_base)
-      9 -> process_move_relative_base_instruction(instruction, program, input, pointer, relative_base)
-      99 -> process_halt_instruction(instruction, program, input, pointer, relative_base)
+  @spec run_until_halt(Intcode.t(), integer) :: any
+  def run_until_halt(%__MODULE__{} = program, max_iterations \\ 100_000_000) do
+    Enum.reduce_while(1..max_iterations, {program, []}, fn (_, {program, outputs}) ->
+      case Intcode.run_until_output(program) do
+        {_program, nil, :halt} -> {:halt, outputs}
+        {program, output, :cont} -> {:cont, {program, outputs ++ [output]}}
+      end
+    end)
+  end
+
+  @spec process_next_instruction(Intcode.t()) :: {Intcode.t(), any, :cont | :halt}
+  defp process_next_instruction(%__MODULE__{} = program) do
+    case next_instruction(program) do
+      %{opcode: 1} = instruction ->
+        process_sum(instruction, program)
+      %{opcode: 2} = instruction ->
+        process_mul(instruction, program)
+      %{opcode: 3} = instruction ->
+        process_input(instruction, program)
+      %{opcode: 4} = instruction ->
+        process_output(instruction, program)
+      %{opcode: 5} = instruction ->
+        process_jump_if_true(instruction, program)
+      %{opcode: 6} = instruction ->
+        process_jump_if_false(instruction, program)
+      %{opcode: 7} = instruction ->
+        process_less_than(instruction, program)
+      %{opcode: 8} = instruction ->
+        process_equals(instruction, program)
+      %{opcode: 9} = instruction ->
+        process_move_stack_pointer(instruction, program)
+      %{opcode: 99} = instruction ->
+        process_halt(instruction, program)
     end
   end
 
-  def process_sum_instruction(instruction, program, input, pointer, relative_base) do
-    a = get_value(instruction.first_mode, Enum.at(program, pointer + 1), program, relative_base)
-    b = get_value(instruction.second_mode, Enum.at(program, pointer + 2), program, relative_base)
-    target = get_address(instruction.third_mode, Enum.at(program, pointer + 3), relative_base)
-    {List.replace_at(program, target, a + b), input, pointer + 4, relative_base, nil, :go}
+  defp process_sum(%{:opcode => 1} = instruction, %__MODULE__{} = program) do
+    a = get_value(program, program.execution_pointer + 1, instruction.first_mode)
+    b = get_value(program, program.execution_pointer + 2, instruction.second_mode)
+    target = get_address(program, program.execution_pointer + 3, instruction.third_mode)
+
+    next_program = %Intcode{
+      program
+      | memory: Map.put(program.memory, target, a + b),
+        execution_pointer: program.execution_pointer + 4
+    }
+    {next_program, nil, :cont}
   end
 
-  def process_mul_instruction(instruction, program, input, pointer, relative_base) do
-    a = get_value(instruction.first_mode, Enum.at(program, pointer + 1), program, relative_base)
-    b = get_value(instruction.second_mode, Enum.at(program, pointer + 2), program, relative_base)
-    target = get_address(instruction.third_mode, Enum.at(program, pointer + 3), relative_base)
+  defp process_mul(%{:opcode => 2} = instruction, %__MODULE__{} = program) do
+    a = get_value(program, program.execution_pointer + 1, instruction.first_mode)
+    b = get_value(program, program.execution_pointer + 2, instruction.second_mode)
+    target = get_address(program, program.execution_pointer + 3, instruction.third_mode)
 
-    {List.replace_at(program, target, a * b), input, pointer + 4, relative_base, nil, :go}
+    next_program = %Intcode{
+      program
+      | memory: Map.put(program.memory, target, a * b),
+        execution_pointer: program.execution_pointer + 4
+    }
+
+    {next_program, nil, :cont}
   end
 
-  def process_input_instruction(instruction, program, input, pointer, relative_base) do
-    {value, popped_input} = List.pop_at(input, 0)
-    target = get_address(instruction.first_mode, Enum.at(program, pointer + 1), relative_base)
-    {List.replace_at(program, target, value), popped_input, pointer + 2, relative_base, nil, :go}
+  defp process_input(%{:opcode => 3} = instruction, %__MODULE__{} = program) do
+    [value | remaining_input] = program.input
+    target = get_address(program, program.execution_pointer + 1, instruction.first_mode)
+
+    next_program = %Intcode{
+      program
+      | memory: Map.put(program.memory, target, value),
+        execution_pointer: program.execution_pointer + 2,
+        input: remaining_input
+    }
+
+    {next_program, nil, :cont}
   end
 
-  def process_output_instruction(instruction, program, input, pointer, relative_base) do
-    value = get_value(instruction.first_mode, Enum.at(program, pointer + 1), program, relative_base)
-    {program, input, pointer + 2, relative_base, value, :halt}
+  defp process_output(%{:opcode => 4} = instruction, %__MODULE__{} = program) do
+    output = get_value(program, program.execution_pointer + 1, instruction.first_mode)
+
+    next_program = %Intcode{
+      program
+      | execution_pointer: program.execution_pointer + 2,
+    }
+
+    {next_program, output, :cont}
   end
 
-  def process_jump_if_true_instruction(instruction, program, input, pointer, relative_base) do
-    a = get_value(instruction.first_mode, Enum.at(program, pointer + 1), program, relative_base)
-    b = get_value(instruction.second_mode, Enum.at(program, pointer + 2), program, relative_base)
+  defp process_jump_if_true(%{:opcode => 5} = instruction, %__MODULE__{} = program) do
+    a = get_value(program, program.execution_pointer + 1, instruction.first_mode)
+    b = get_value(program, program.execution_pointer + 2, instruction.second_mode)
 
-    next_pointer = if a != 0, do: b, else: pointer + 3
-    {program, input, next_pointer, relative_base, nil, :go}
+    next_pointer = if a != 0, do: b, else: program.execution_pointer + 3
+    next_program = %Intcode{
+      program
+      | execution_pointer: next_pointer,
+    }
+
+    {next_program, nil, :cont}
   end
 
-  def process_jump_if_false_instruction(instruction, program, input, pointer, relative_base) do
-    a = get_value(instruction.first_mode, Enum.at(program, pointer + 1), program, relative_base)
-    b = get_value(instruction.second_mode, Enum.at(program, pointer + 2), program, relative_base)
+  defp process_jump_if_false(%{:opcode => 6} = instruction, %__MODULE__{} = program) do
+    a = get_value(program, program.execution_pointer + 1, instruction.first_mode)
+    b = get_value(program, program.execution_pointer + 2, instruction.second_mode)
 
-    next_pointer = if a == 0, do: b, else: pointer + 3
-    {program, input, next_pointer, relative_base, nil, :go}
+    next_pointer = if a == 0, do: b, else: program.execution_pointer + 3
+    next_program = %Intcode{
+      program
+      | execution_pointer: next_pointer,
+    }
+
+    {next_program, nil, :cont}
   end
 
-  def process_less_than_instruction(instruction, program, input, pointer, relative_base) do
-    a = get_value(instruction.first_mode, Enum.at(program, pointer + 1), program, relative_base)
-    b = get_value(instruction.second_mode, Enum.at(program, pointer + 2), program, relative_base)
-    target = get_address(instruction.third_mode, Enum.at(program, pointer + 3), relative_base)
+  defp process_less_than(%{:opcode => 7} = instruction, %__MODULE__{} = program) do
+    a = get_value(program, program.execution_pointer + 1, instruction.first_mode)
+    b = get_value(program, program.execution_pointer + 2, instruction.second_mode)
+    target = get_address(program, program.execution_pointer + 3, instruction.third_mode)
 
     value = if a < b, do: 1, else: 0
-    {List.replace_at(program, target, value), input, pointer + 4, relative_base, nil, :go}
+    next_program = %Intcode{
+      program
+      | memory: Map.put(program.memory, target, value),
+        execution_pointer: program.execution_pointer + 4
+    }
+
+    {next_program, nil, :cont}
   end
 
-  def process_equals_instruction(instruction, program, input, pointer, relative_base) do
-    a = get_value(instruction.first_mode, Enum.at(program, pointer + 1), program, relative_base)
-    b = get_value(instruction.second_mode, Enum.at(program, pointer + 2), program, relative_base)
-    target = get_address(instruction.third_mode, Enum.at(program, pointer + 3), relative_base)
+  defp process_equals(%{:opcode => 8} = instruction, %__MODULE__{} = program) do
+    a = get_value(program, program.execution_pointer + 1, instruction.first_mode)
+    b = get_value(program, program.execution_pointer + 2, instruction.second_mode)
+    target = get_address(program, program.execution_pointer + 3, instruction.third_mode)
 
     value = if a == b, do: 1, else: 0
-    {List.replace_at(program, target, value), input, pointer + 4, relative_base, nil, :go}
+    next_program = %Intcode{
+      program
+      | memory: Map.put(program.memory, target, value),
+        execution_pointer: program.execution_pointer + 4
+    }
+
+    {next_program, nil, :cont}
   end
 
-  def process_move_relative_base_instruction(instruction, program, input, pointer, relative_base) do
-    value = get_value(instruction.first_mode, Enum.at(program, pointer + 1), program, relative_base)
-    {program, input, pointer + 2, relative_base + value, nil, :go}
+  defp process_move_stack_pointer(%{:opcode => 9} = instruction, %__MODULE__{} = program) do
+    value = get_value(program, program.execution_pointer + 1, instruction.first_mode)
+
+    next_program = %Intcode{
+      program
+      | execution_pointer: program.execution_pointer + 2,
+        stack_pointer: program.stack_pointer + value
+    }
+
+    {next_program, nil, :cont}
   end
 
-  def process_halt_instruction(_, program, input, _pointer, _relative_base) do
-    {program, input, -1, -1, nil, :halt}
+  defp process_halt(%{:opcode => 99}, %__MODULE__{} = program) do
+    {program, nil, :halt}
   end
 
-  @spec get_value(0 | 1 | 2, integer, [integer], integer) :: integer
-  def get_value(0, position, program, _relative_base), do: Enum.at(program, position)
-  def get_value(1, value, _program, _relative_base),  do: value
-  def get_value(2, value, program, relative_base) do
-    Enum.at(program, relative_base + value)
+
+  defp get_value(%__MODULE__{} = program, pointer, 1), do: Map.get(program.memory, pointer)
+  defp get_value(%__MODULE__{} = program, pointer, mode) do
+    Map.get(program.memory, get_address(program, pointer, mode), 0)
   end
 
-  @spec get_address(0 | 2, integer, integer) :: any
-  def get_address(0, value, _relative_base), do: value
-  def get_address(2, value, relative_base), do: relative_base + value
+  defp get_address(%__MODULE__{} = program, pointer, 0), do: Map.get(program.memory, pointer, 0)
 
-  @spec parse_instruction(integer) :: Day9.Intcode.t()
-  def parse_instruction(instruction) do
+  defp get_address(%__MODULE__{} = program, pointer, 2),
+    do: Map.get(program.memory, pointer, 0) + program.stack_pointer
+
+    defp next_instruction(%Intcode{} = program) do
+    parse_instruction(Map.get(program.memory, program.execution_pointer, 0))
+  end
+
+  defp parse_instruction(instruction) do
     [_, a, b, c | de] = Integer.digits(instruction + 100_000)
-    %Intcode{
-      opcode: Integer.undigits(de),
-      first_mode: c,
-      second_mode: b,
-      third_mode: a
+
+    %{
+      :opcode => Integer.undigits(de),
+      :first_mode => c,
+      :second_mode => b,
+      :third_mode => a
     }
   end
 end
